@@ -1,0 +1,369 @@
+// Luật giám sát ở client: baseline, phát hiện vi phạm (APP có cửa sổ/USB/NET), đếm focus/đáp án và gom feature theo chu kỳ server cấp, mặc định 30 giây (Người 2).
+package exam.client;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import exam.client.WindowsProbe.Conn;
+import exam.client.WindowsProbe.Proc;
+import exam.client.WindowsProbe.Win;
+import exam.common.Protocol;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+public class Monitor {
+    private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
+
+    private final boolean windows = WindowsProbe.isWindows();
+    private final Runnable scanTask;
+    private final long scanMs;
+    private volatile long featuresMs;
+    private static final long APPS_SECONDS = 15;
+    private ScheduledExecutorService appsTimer;                 // báo danh sách app đang mở, tạo ở lần PRECHECK đầu tiên
+    private Supplier<List<Win>> appsLookup = () -> windows ? WindowsProbe.windowedApps() : List.of();
+    private String lastApps;                                    // JSON của lần gửi APPS gần nhất; null = chưa gửi
+    private ScheduledExecutorService scanner, heartbeat;        // hai luồng riêng: quét chậm không được làm trễ FEATURES
+    private volatile Consumer<JsonObject> sender;
+
+    // Luật và baseline lấy ở lần PRECHECK cuối cùng
+    private volatile JsonObject rules = new JsonObject();
+    private Set<String> baselineProcesses = new HashSet<>(), baselineRoots = new HashSet<>(),
+        baselineIps = new HashSet<>();
+    private AppRules appRules = new AppRules(new JsonObject());
+    private Function<Collection<Integer>, List<Win>> windowLookup = WindowsProbe::windowsOf;
+    private Map<String, String> blockedIpToDomain = new HashMap<>();
+    private final Set<String> sentViolations = new HashSet<>();   // (kind, detail) chỉ gửi một lần cả buổi
+    private final Set<String> flaggedWindowApps = new HashSet<>();   // mỗi app có cửa sổ chỉ báo một lần dù tiêu đề đổi
+    /** pid tiến trình mới -> số lần còn được hỏi cửa sổ (cửa sổ có thể hiện chậm hơn tiến trình vài giây). */
+    private final Map<Integer, Integer> watching = new HashMap<>();
+    private static final int WINDOW_CHECKS = 10;
+
+    // Bộ đếm của cửa sổ FEATURES hiện tại
+    private int window = 1, focusLostCount, violationsInWindow, answers;
+    private final Set<String> newProcesses = new HashSet<>(), newHosts = new HashSet<>();
+    // Đã từng được đếm trong buổi thi: mỗi tiến trình/IP mới chỉ tính vào cửa sổ đầu tiên nó xuất hiện
+    private final Set<String> seenProcesses = new HashSet<>(), seenHosts = new HashSet<>();
+    private long focusLostMillis;
+    private long lostSince = -1;                                  // -1 = đang ở trong cửa sổ thi
+
+    public Monitor() { this(null, 3000, Protocol.FEATURE_INTERVAL_DEFAULT * 1000L); }
+    /** Cho test: {@code scanTask} thay phép quét thật (null = quét tiến trình/USB/mạng như bình thường). */
+    public Monitor(Runnable scanTask, long scanMs, long featuresMs) {
+        this.scanTask = scanTask != null ? scanTask : this::scan;
+        this.scanMs = scanMs; this.featuresMs = featuresMs;
+    }
+
+    /** Lấy chu kỳ gửi FEATURES từ LOGIN_OK; phải gọi trước start(). Thiếu hoặc sai thì 30 giây. */
+    public void useIntervalFrom(JsonObject loginOk) {
+        featuresMs = Protocol.featureInterval(loginOk) * 1000L;
+    }
+
+    public long featureIntervalMillis() { return featuresMs; }
+
+    /** Danh sách vấn đề (rỗng = đạt). Chạy lệnh hệ thống nên phải gọi ngoài luồng giao diện. */
+    public List<String> precheck(JsonObject rules) {
+        if (!windows) {
+            System.err.println("Cảnh báo: không phải Windows, bỏ qua PRECHECK và quét tiến trình/mạng/USB");
+            return new ArrayList<>();
+        }
+        List<Proc> procs = Debug.timed("PRECHECK tasklist", WindowsProbe::processList);
+        List<Win> wins = Debug.timed("PRECHECK app có cửa sổ", WindowsProbe::windowedApps);
+        List<String> issues = precheckFrom(rules, procs, wins, WindowsProbe.removableDrives());
+        // Luôn lưu baseline: lần PRECHECK đạt cuối cùng là mốc so sánh trong giờ thi
+        setBaseline(names(procs), WindowsProbe.roots(), WindowsProbe.remoteIps(), rules);
+        return issues;
+    }
+
+    /** Phần luật của PRECHECK, không chạy lệnh nào nên test được bằng dữ liệu mẫu. */
+    public List<String> precheckFrom(JsonObject rules, List<Proc> procs, List<Win> wins, Set<String> drives) {
+        List<String> issues = new ArrayList<>(new AppRules(rules).appIssues(procs.stream().map(Proc::name).toList(), wins));
+        for (String drive : drives) {
+            issues.add("Đang cắm USB: " + drive);
+        }
+        return issues;
+    }
+
+    private static Set<String> names(List<Proc> procs) {
+        Set<String> set = new HashSet<>();
+        for (Proc p : procs) { set.add(p.name()); }
+        return set;
+    }
+
+    private synchronized void setBaseline(Set<String> procs, Set<String> roots, Set<String> ips, JsonObject rules) {
+        Set<String> normalized = new HashSet<>();
+        for (String p : procs) { normalized.add(AppRules.norm(p)); }
+        this.baselineProcesses = normalized;
+        this.baselineRoots = roots;
+        this.baselineIps = ips;
+        this.rules = rules;
+        this.appRules = new AppRules(rules);
+        this.watching.clear();
+    }
+
+    /**
+     * Giám thị đổi luật giữa giờ thi: áp dụng ngay mà KHÔNG lấy lại baseline. App vừa bị cấm mà đang mở được gỡ khỏi
+     * baseline để lần quét kế tiếp coi là mới và báo vi phạm.
+     */
+    public synchronized void updateRules(JsonObject newRules) {
+        this.rules = newRules;
+        this.appRules = new AppRules(newRules);
+        baselineProcesses.removeIf(appRules::blacklisted);
+        if (scanner != null) { scanner.execute(() -> safely(this::resolveBlockedDomains)); }     // tên miền bị cấm có thể đã đổi
+    }
+
+    /** Cho test thay lệnh PowerShell hỏi cửa sổ theo pid. */
+    public void setWindowLookupForTest(Function<Collection<Integer>, List<Win>> lookup) { this.windowLookup = lookup; }
+
+    /** Cho test đặt baseline trực tiếp, không cần chạy lệnh Windows. */
+    public synchronized void setBaselineForTest(Set<String> processes, Set<String> roots, Set<String> remoteIps,
+            JsonObject rules, Map<String, String> blockedIpToDomain, Consumer<JsonObject> sender) {
+        setBaseline(processes, roots, remoteIps, rules);
+        this.blockedIpToDomain = blockedIpToDomain;
+        this.sender = sender;
+    }
+
+    public void start(Consumer<JsonObject> sender) {
+        this.sender = sender;
+        scanner = newThread("monitor-scan");
+        heartbeat = newThread("monitor-features");
+        scanner.execute(() -> safely(this::resolveBlockedDomains));        // DNS có thể chậm nên không chạy ở luồng giao diện
+        scanner.scheduleWithFixedDelay(() -> safely(scanTask), scanMs, scanMs, TimeUnit.MILLISECONDS);
+        heartbeat.scheduleAtFixedRate(() -> safely(this::sendFeatures), featuresMs, featuresMs, TimeUnit.MILLISECONDS);
+    }
+
+    private static ScheduledExecutorService newThread(String name) {
+        return Executors.newSingleThreadScheduledExecutor(r -> { Thread t = new Thread(r, name); t.setDaemon(true); return t; });
+    }
+
+    /** Gửi APPS ngay (lần đầu), rồi cứ 15 giây kiểm tra một lần và chỉ gửi khi danh sách đổi. Gọi nhiều lần cũng chỉ có một bộ hẹn giờ. */
+    public synchronized void reportApps(Consumer<JsonObject> out) {
+        if (appsTimer != null) { return; }
+        appsTimer = newThread("monitor-apps");
+        appsTimer.scheduleWithFixedDelay(() -> safely(() -> sendAppsIfChanged(out)), 0, APPS_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /** Server mới (hoặc vào lại) chưa có danh sách: lần kiểm tra kế tiếp sẽ gửi lại dù không đổi. */
+    public synchronized void forgetApps() { lastApps = null; }
+
+    /** Cho test thay lệnh PowerShell liệt kê app có cửa sổ. */
+    public void setAppsLookupForTest(Supplier<List<Win>> lookup) { this.appsLookup = lookup; }
+
+    /** Gửi APPS nếu danh sách khác lần trước. Trên Linux danh sách luôn rỗng (gửi một lần). */
+    public void sendAppsIfChanged(Consumer<JsonObject> out) {
+        JsonObject m = appsMessage(appsLookup.get());
+        synchronized (this) {
+            String json = m.toString();
+            if (json.equals(lastApps)) { return; }
+            lastApps = json;
+        }
+        out.accept(m);
+    }
+
+    /** APPS gồm các app có cửa sổ (bỏ tiến trình hệ thống), sắp theo tên rồi tiêu đề, không trùng. */
+    private synchronized JsonObject appsMessage(List<Win> wins) {
+        List<Win> sorted = new ArrayList<>(wins);
+        sorted.sort(Comparator.comparing((Win w) -> w.name().toLowerCase()).thenComparing(Win::title));
+        Set<String> seen = new HashSet<>();
+        JsonArray apps = new JsonArray();
+        for (Win w : sorted) {
+            if (appRules.skip(w.name()) || !seen.add(w.name() + "|" + w.title())) { continue; }
+            JsonObject app = new JsonObject();
+            app.addProperty("name", w.name());
+            app.addProperty("title", w.title());
+            apps.add(app);
+        }
+        JsonObject m = Protocol.msg(Protocol.APPS);
+        m.add("apps", apps);
+        return m;
+    }
+
+    public void stop() {
+        for (ScheduledExecutorService e : new ScheduledExecutorService[] {scanner, heartbeat, appsTimer}) {
+            if (e != null) { e.shutdownNow(); }
+        }
+    }
+
+    /** Một việc định kỳ ném exception sẽ bị executor hủy lặng lẽ, nên bắt lại và báo ra stderr. */
+    private void safely(Runnable task) {
+        try {
+            task.run();
+        } catch (RuntimeException e) {
+            System.err.println("Lỗi giám sát: " + e);
+        }
+    }
+
+    private void resolveBlockedDomains() {
+        Map<String, String> table = WindowsProbe.resolve(lowerSet(rules, "blockedDomains"));
+        synchronized (this) {
+            blockedIpToDomain = table;
+        }
+    }
+
+    private void scan() {
+        if (!windows) { return; }
+        processSnapshot(Debug.timed("quét tasklist", WindowsProbe::processList), Debug.timed("quét ổ đĩa", WindowsProbe::roots),
+            Debug.timed("quét netstat", WindowsProbe::remoteConnections));
+    }
+
+    /** Dành cho test cũ chỉ có tên tiến trình, không có pid nên không hỏi cửa sổ. */
+    public void processSnapshot(Set<String> processes, Set<String> roots, Set<String> remoteIps) {
+        processSnapshot(processes.stream().map(n -> new Proc(n, -1)).toList(), roots, remoteIps);
+    }
+
+    /**
+     * Áp dụng một lần quét. Tiến trình nền không bao giờ là vi phạm (chỉ đếm vào newProcesses); chỉ app bị cấm hoặc
+     * app mới có cửa sổ không được phép mới bị báo. Hỏi PowerShell chậm nên làm ngoài khối synchronized.
+     */
+    public void processSnapshot(List<Proc> procs, Set<String> roots, Set<String> remoteIps) {
+        List<Conn> conns = new ArrayList<>();
+        for (String ip : remoteIps) { conns.add(new Conn(ip, -1)); }
+        processSnapshot(procs, roots, conns);
+    }
+
+    /** Như trên nhưng mỗi kết nối kèm PID để vi phạm NET nêu được tên chương trình. */
+    public void processSnapshot(List<Proc> procs, Set<String> roots, List<Conn> connections) {
+        List<Integer> toCheck;
+        synchronized (this) {
+            toCheck = applySnapshot(procs, roots, connections);
+        }
+        if (toCheck.isEmpty()) { return; }
+        List<Win> found = Debug.timed("hỏi cửa sổ của " + toCheck.size() + " tiến trình mới", () -> windowLookup.apply(toCheck));
+        synchronized (this) {
+            for (Win w : found) {
+                watching.put(w.pid(), 0);                          // đã thấy cửa sổ, không hỏi lại
+                if (!appRules.skip(w.name()) && !appRules.windowAllowed(w.name()) && flaggedWindowApps.add(AppRules.norm(w.name()))) {
+                    violate("APP", AppRules.describe(w));
+                }
+            }
+        }
+    }
+
+    /** Trả về các pid mới cần hỏi xem có cửa sổ không. */
+    private List<Integer> applySnapshot(List<Proc> procs, Set<String> roots, List<Conn> connections) {
+        Set<Integer> alive = new HashSet<>();
+        for (Proc p : procs) {
+            String n = AppRules.norm(p.name());
+            if (appRules.skip(n) || baselineProcesses.contains(n)) { continue; }
+            if (seenProcesses.add(n)) { newProcesses.add(n); }
+            if (appRules.blacklisted(n)) {
+                violate("APP", p.name().toLowerCase());
+            } else if (p.pid() >= 0) {
+                alive.add(p.pid());
+                watching.putIfAbsent(p.pid(), WINDOW_CHECKS);
+            }
+        }
+        for (String root : roots) {
+            if (!baselineRoots.contains(root)) { violate("USB", root); }
+        }
+        Map<Integer, String> processNames = new HashMap<>();
+        for (Proc p : procs) { processNames.put(p.pid(), p.name()); }
+        for (Conn conn : connections) {
+            String domain = blockedIpToDomain.get(conn.ip());
+            if (domain != null) { violateNet(domain, conn, processNames); }
+            if (!baselineIps.contains(conn.ip()) && seenHosts.add(conn.ip())) { newHosts.add(conn.ip()); }
+        }
+        watching.keySet().retainAll(alive);
+        List<Integer> toCheck = new ArrayList<>();
+        for (Map.Entry<Integer, Integer> e : watching.entrySet()) {
+            if (e.getValue() > 0) {
+                e.setValue(e.getValue() - 1);
+                toCheck.add(e.getKey());
+            }
+        }
+        return toCheck;
+    }
+
+    /** "<tên miền> (<IP>) – <chương trình>"; chỉ báo một lần cho mỗi cặp tên miền + chương trình dù IP khác nhau. */
+    private void violateNet(String domain, Conn conn, Map<Integer, String> processNames) {
+        String detail = domain + " (" + conn.ip() + ")";
+        String program = "";
+        if (conn.pid() >= 0) {
+            program = processNames.getOrDefault(conn.pid(), "PID " + conn.pid());
+            detail += " – " + program;
+        }
+        violate("NET", detail, domain + "|" + program);
+    }
+
+    private void violate(String kind, String detail) { violate(kind, detail, detail); }
+
+    /** dedupKey: hai vi phạm cùng kind và cùng dedupKey chỉ gửi một lần cả buổi. */
+    private void violate(String kind, String detail, String dedupKey) {
+        if (!sentViolations.add(kind + "|" + dedupKey)) { return; }
+        violationsInWindow++;
+        JsonObject m = Protocol.msg(Protocol.VIOLATION);
+        m.addProperty("kind", kind);
+        m.addProperty("detail", detail);
+        m.addProperty("time", LocalTime.now().format(TIME));
+        if (sender != null) { sender.accept(m); }
+    }
+
+    private void sendFeatures() {
+        JsonObject m = buildFeatures();
+        Debug.log("gửi FEATURES " + m);
+        if (sender != null) { sender.accept(m); }
+    }
+
+    /** Tạo tin FEATURES của cửa sổ hiện tại rồi reset bộ đếm. */
+    public synchronized JsonObject buildFeatures() {
+        long now = System.currentTimeMillis();
+        if (lostSince >= 0) {                  // đang rời cửa sổ: chốt phần đến giờ, phần sau tính cho cửa sổ kế
+            focusLostMillis += now - lostSince;
+            lostSince = now;
+        }
+        int[] v = {newProcesses.size(), focusLostCount, (int) Math.round(focusLostMillis / 1000.0),
+            newHosts.size(), violationsInWindow, answers};
+        JsonArray values = new JsonArray();
+        for (int x : v) {
+            values.add(x);
+        }
+        JsonObject m = Protocol.msg(Protocol.FEATURES);
+        m.addProperty("window", window++);
+        m.add("values", values);
+        newProcesses.clear();
+        newHosts.clear();
+        focusLostCount = violationsInWindow = answers = 0;
+        focusLostMillis = 0;
+        return m;
+    }
+
+    public synchronized void recordAnswer() { answers++; }
+
+    public synchronized void focusLost() {
+        if (lostSince < 0) {
+            lostSince = System.currentTimeMillis();
+            focusLostCount++;
+        }
+    }
+
+    public synchronized void focusGained() {
+        if (lostSince >= 0) {
+            focusLostMillis += System.currentTimeMillis() - lostSince;
+            lostSince = -1;
+        }
+    }
+
+    private static Set<String> lowerSet(JsonObject rules, String key) {
+        Set<String> set = new LinkedHashSet<>();
+        if (rules.get(key) instanceof JsonArray arr) {
+            for (JsonElement e : arr) {
+                set.add(e.getAsString().toLowerCase());
+            }
+        }
+        return set;
+    }
+}
