@@ -1,0 +1,10 @@
+target/
+results.csv
+ket-qua/
+__pycache__/
+.venv/
+.pytest_cache/
+.idea/
+.vscode/
+*.iml
+dependency-reduced-pom.xml
